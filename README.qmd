@@ -11,25 +11,23 @@ knitr::opts_chunk$set(
 )
 ```
 
-# censoring-tutorial-presentation
+# Introduction to Censored Data
 
 <!-- badges: start -->
 <!-- badges: end -->
 
-The goal of censoring-tutorial-presentation is to ...
+Learning outcomes for this presentation:
 
-What is special about using `README.Rmd` instead of just `README.md`? You can include R chunks like so:
+1. Define censored data, including left, right, and interval censored data.
+1. Adjust the likelihood function of a parametric model to account for
+deterministic censoring.
+1. Implement maximum likelihood methods for censored outcomes, like HAI titer
+using an optimizer and using the `survival` package.
+1. Ratios of censored values (e.g. titer increase outcomes).
+1. Implement bayesian methods for censored outcomes, like HAI titer, using Stan
+or `brms`.
+1. Implement bayesian joint modeling methods for censored predictors, like
+norovirus HBGA titer for infection outcome in the bivalent study using Stan.
+  - https://github.com/ahgroup/NoV-Ab-Correlates-of-Protection/tree/main
 
-```{r cars}
-summary(cars)
-```
 
-You'll still need to render `README.Rmd` regularly, to keep `README.md` up-to-date.
-
-You can also embed plots, for example:
-
-```{r pressure, echo = FALSE}
-plot(pressure)
-```
-
-In that case, don't forget to commit and push the resulting figure files, so they display on GitHub.

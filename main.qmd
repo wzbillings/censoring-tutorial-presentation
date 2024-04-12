@@ -1,5 +1,5 @@
 ---
-title: "Censored data intro"
+title: "Linear models and censored data"
 author: "Zane Billings"
 date: last-modified
 date-format: iso
