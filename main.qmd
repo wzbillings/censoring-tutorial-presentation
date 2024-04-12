@@ -1,0 +1,13 @@
+---
+title: "Censored data intro"
+author: "Zane Billings"
+date: last-modified
+date-format: iso
+format: revealjs
+execute: 
+  freeze: auto
+---
+
+## Left-censored data
+
+put the picture here
