@@ -3,11 +3,593 @@ title: "Linear models and censored data"
 author: "Zane Billings"
 date: last-modified
 date-format: iso
-format: revealjs
+format:
+  revealjs:
+    scrollable: true
+    auto-stretch: false
+    smaller: true
+    slide-number: true
 execute: 
   freeze: auto
+  echo: true
 ---
 
-## Left-censored data
+```{r setup, include = FALSE}
+library(tidyverse)
+library(hgp)
+library(lubridate)
+library(patchwork)
+library(brms)
+library(cmdstanr)
+ggplot2::theme_set(hgp::theme_ms())
+```
 
-put the picture here
+
+## Censored data are partially known.
+
+* In general if a data point $x$ is censored, we don't know the exact
+value of $x$, but we know that $x \in \left(x_L, x_u\right)$.
+* The most common example in epidemiology is a time-to-event outcome in
+survival analysis.
+
+```{r}
+#| label: right censored example figure
+#| echo: false
+
+study_start <- lubridate::as_date("2023-01-10")
+study_end <- lubridate::as_date("2023-05-16")
+pretty_date <- lubridate::stamp_date("October 07, 1998")
+set.seed(1981235)
+rc <-
+	tibble::tribble(
+		~event_time,
+		"2023-01-21",
+		"2023-01-23",
+		"2023-02-12",
+		"2023-02-12",
+		"2023-04-13",
+		"2023-03-05",
+		"2023-05-29",
+		"2023-05-03",
+		"2023-05-21",
+		"2023-07-20"
+	) |>
+	dplyr::slice_sample(n = 10) |>
+	dplyr::mutate(
+		censored = factor(
+			event_time >= study_end,
+			levels = c(FALSE, TRUE),
+			labels = c("Observed", "Censored")
+		),
+		event_time = lubridate::ymd(event_time),
+		c_event_time = dplyr::if_else(
+			event_time >= study_end,
+			study_end,
+			event_time
+		),
+		id = dplyr::row_number()
+	)
+ggplot(rc) +
+	aes(x = study_start, color = censored, group = id) +
+	geom_vline(xintercept = study_start, color = "gray", lwd = 2) +
+	geom_vline(xintercept = study_end, color = "gray", lwd = 2) +
+	geom_segment(
+		aes(xend = event_time, y = id, yend = id),
+		lwd = 1.5,
+		show.legend = FALSE
+	) +
+	geom_point(
+		aes(x = study_start, y = id),
+		size = 3, stroke = 2, shape = 16,
+		show.legend = FALSE
+	) +
+	geom_point(
+		aes(x = event_time, y = id, shape = censored),
+		size = 3, stroke = 2
+	) +
+	geom_label(
+		aes(
+			# Insane date math to get the graphical midpoint
+			x = lubridate::as_date((
+				pmax(as.numeric(study_start), as.numeric(study_start - 14 * 2)) +
+					pmin(as.numeric(event_time), as.numeric(study_end + 14 * 1))
+			) / 2),
+			label = paste0("Participant #", id),
+			y = id + 0.45
+		), fill = "#ffffff", col = "black"
+	) +
+	scale_color_manual(values = c("black", "red"), name = NULL) +
+	scale_x_date(
+		name = "Calendar time to event",
+		expand = expansion(mult = 0.025),
+		#date_breaks = "2 weeks",
+		breaks = seq(study_start, study_end + 14, 14),
+		date_labels = "%b %d"
+	) +
+	coord_cartesian(xlim = c(study_start, study_end + 14)) +
+	scale_y_continuous(breaks = NULL, name = "Participant") +
+	scale_shape_manual(values = c(16, 4), name = NULL)
+```
+
+
+* Participants 2, 6, and 10 have event times in $\left[\text{May 16}, \infty\right).$
+* If we just throw those people out, or count their event date as May 16, we
+bias the distribution of event times to be overall lower. This could make our
+study results better or worse depending on context.
+* Called **right censored** data because the RIGHT endpoint of the interval is
+unknown.
+
+### Lab assays are also commonly censored.
+
+```{r}
+#| label: left censoring example
+#| echo: false
+
+set.seed(123487980)
+lc_example <- tibble::tibble(
+	ab = rnorm(10000, 5, 2.3),
+	ab_cens = ifelse(ab < 5 - 2 * 2, 5 - 2 * 2, ab),
+	ab_exp = 2 ^ ab_cens
+)
+
+ggplot(lc_example) +
+	aes(x = ab_exp, y = after_stat(density)) +
+	geom_histogram(
+		color = "black",
+		fill = "gray",
+		binwidth = 0.5,
+		boundary = 2,
+		closed = "right"
+	) +
+	scale_x_continuous(
+		name = "Some antibody titer (titer units)",
+		trans = "log2",
+		breaks = 2 ^ seq(-2, 16, 2),
+		minor_breaks = 2 ^ seq(-2, 16, 1),
+		#labels = scales::label_math(expr = 2^.x),
+		limits = 2 ^ c(0, 14)
+	) +
+	annotate(
+		"segment",
+		x = 2 ^ 0.75,
+		xend = 2 ^ 0.75,
+		y = 0.1,
+		yend = 0.083,
+		arrow = arrow(length = unit(0.1, "inches"))
+	) +
+	annotate(
+		"label",
+		x = 2 ^ 0.8,
+		y = 0.1,
+		label = "Limit of detection",
+		size = 5
+	)
+
+```
+
+* Immunological measurements often have a lower limit to the titer that can
+be accurately measured. (The *lower limit of detection, LoD*.)
+* In this plot, if the true ("latent") antibody titer is less than 2 is
+recorded as 2. Although those values are really in $(0, 2]$ on the natural
+scale, or $(-\infty, 1]$ on the log scale.
+* So the LoD measurements are **left censored** because the left endpoint of the
+interval is unknown.
+
+### Data can be simultaneously left and right censored.
+
+```{r}
+#| label: left and right censoring example
+#| echo: false
+
+set.seed(4654732)
+lcrc_example <- tibble::tibble(
+	ab = rnorm(10000, 5, 2.3),
+	ab_cens = ifelse(ab < 5 - 2 * 2, 5 - 2 * 2, ab),
+	ab_cens2 = ifelse(ab_cens > 5 + 2 * 2, 5 + 2 * 2, ab_cens),
+	ab_exp = 2 ^ ab_cens2
+)
+
+ggplot(lcrc_example) +
+	aes(x = ab_exp, y = after_stat(density)) +
+	geom_histogram(
+		color = "black",
+		fill = "gray",
+		binwidth = 0.5,
+		boundary = 2,
+		closed = "right"
+	) +
+	scale_x_continuous(
+		name = "Some antibody titer (titer units)",
+		trans = "log2",
+		breaks = 2 ^ seq(-2, 16, 2),
+		minor_breaks = 2 ^ seq(-2, 16, 1),
+		limits = 2 ^ c(0, 10)
+	)
+
+```
+
+* The same assay can have both a lower limit and an upper limit of detection,
+so a variable can contain left censored and right censored values.
+* However, a specific observation can only be left censored or right censored.
+
+### Interval censoring provides a more general framework.
+
+```{r}
+#| label: interval censoring example
+#| echo: false
+
+
+set.seed(12341234)
+int_example <- tibble::tibble(
+	ab = rnorm(1000, 5, 2.3),
+	ab_cens = ifelse(ab < 5 - 2 * 2, 5 - 2 * 2, ab),
+	ab_cens2 = ifelse(ab_cens > 5 + 2 * 2, 5 + 2 * 2, ab_cens),
+	ab_cens3 = floor(ab_cens2),
+	ab_exp = 2 ^ ab_cens3
+)
+
+int_p1 <-
+	ggplot(int_example) +
+	aes(x = ab_exp, y = after_stat(density)) +
+	geom_histogram(
+		color = "black",
+		fill = "gray",
+		binwidth = 0.5,
+		boundary = 2,
+		closed = "right"
+	) +
+	scale_x_continuous(
+		name = "Observed titer under interval censoring",
+		trans = "log2",
+		breaks = 2 ^ seq(-2, 16, 2),
+		minor_breaks = 2 ^ seq(-2, 16, 1),
+		limits = 2 ^ c(0, 10)
+	)
+
+int_p2 <-
+	ggplot(int_example) +
+	aes(x = 2 ^ ab, 2 ^ ab_cens3, group = 2 ^ ab_cens3) +
+	geom_boxplot() +
+	geom_point(
+		position = position_jitter(width = 0, height = 0.25, seed = 129370),
+		alpha = 0.1
+	) +
+	scale_x_continuous(
+		name = "Latent titer value",
+		trans = "log2",
+		breaks = 2 ^ seq(-2, 16, 2),
+		minor_breaks = 2 ^ seq(-2, 16, 1),
+		#limits = 2 ^ c(0, 10)
+	) +
+		scale_y_continuous(
+		name = "Observed titer value under interval censoring",
+		trans = "log2",
+		breaks = 2 ^ seq(-2, 16, 2),
+		minor_breaks = 2 ^ seq(-2, 16, 1),
+		#limits = 2 ^ c(0, 10)
+	)
+
+int_p1 + int_p2
+```
+
+* Under **interval censoring**, there are a discrete number of possible values we
+can observe, even though the underlying quantity of interest is continuous.
+* Influenza HAI titer and other serial dilution assays are often interval censored.
+* Many interval-censored assays also have limits of detection, like the one
+shown here.
+
+### For example, HAI titers have a lower LoD and are interval censored.
+
+```{r}
+#| label: HAI example
+#| echo: false
+
+hai_transform <- function(x) {return(log2(x / 5))}
+hai_inverse <- function(x) {return(5 * 2 ^ x)}
+
+set.seed(23984)
+hai_ex <-
+	tibble::tibble(
+		z_star = rnorm(1000, 3, 2),
+		z_int = floor(z_star),
+		z_lod = ifelse(z_int < 0, 0, z_int),
+		y_star = hai_inverse(z_star),
+		y_int = hai_inverse(z_int),
+		y_lod = hai_inverse(z_lod)
+	)
+
+hai_ex_latent <-
+	ggplot(hai_ex) +
+	aes(x = y_star / 5) +
+	geom_histogram(
+		color = "black",
+		fill = "gray",
+		binwidth = 0.25,
+		boundary = 5
+	) +
+	scale_x_continuous(
+		trans = "log2",
+		name = "Latent HAI titer",
+		breaks = 2 ^ seq(-6, 10, 2),
+		labels = 5 * 2 ^ seq(-6, 10, 2),
+		limits = 2 ^ c(-4, 8)
+	) +
+	scale_y_continuous(limits = c(0, 200)) +
+	theme(axis.text.x = element_text(size = 8))
+
+hai_ex_int <-
+	ggplot(hai_ex) +
+	aes(x = y_int / 5) +
+	geom_bar(
+		color = "black",
+		fill = "gray"
+	) +
+	scale_x_continuous(
+		trans = "log2",
+		name = "Interval censored",
+		breaks = 2 ^ seq(-6, 10, 2),
+		labels = 5 * 2 ^ seq(-6, 10, 2),
+		limits = 2 ^ c(-4, 8)
+	) +
+		scale_y_continuous(limits = c(0, 200)) +
+	theme(axis.text.x = element_text(size = 8))
+
+hai_ex_lod <-
+	ggplot(hai_ex) +
+	aes(x = y_lod / 5) +
+	geom_bar(
+		color = "black",
+		fill = "gray"
+	) +
+	scale_x_continuous(
+		trans = "log2",
+		name = "w/ lower LoD",
+		breaks = 2 ^ seq(-6, 10, 2),
+		labels = 5 * 2 ^ seq(-6, 10, 2),
+		limits = 2 ^ c(-4, 8)
+	) +
+		scale_y_continuous(limits = c(0, 200)) +
+	theme(axis.text.x = element_text(size = 8))
+
+hai_ex_latent + hai_ex_int + hai_ex_lod
+```
+
+## Censored data biases models.
+
+* Consider the simple example of a standard normal random variable, $z \overset{\mathrm{iid}}{\sim} \text{Normal}(0, 1)$.
+
+```{r}
+#| label: simple example
+
+set.seed(8980)
+simple_ex <- tibble::tibble(
+	z = rnorm(1000)
+)
+```
+
+* We know that if we estimate
+the mean and variance using the normal methods, we'll get an asymptotically
+good estimate as $n \to \infty$.
+* What happens if we impose a lower limit of detection at, say, $z = -1$? We
+can write this as
+
+$$
+Y_i = \begin{cases}
+-1, & Z_i < -1 \\
+Z_i, & Z_i \geq -1
+\end{cases}.
+$$
+
+* And then simulate the censoring.
+
+```{r}
+#| label: simple example censoring
+simple_ex <- simple_ex |>
+	dplyr::mutate(
+		lod = rep(-1, times = 1000),
+		y = ifelse(z < lod, lod, z)
+	)
+
+```
+
+* The distributions are clearly different.
+
+```{r}
+#| label: simple example plot
+
+ggplot(simple_ex) +
+	geom_histogram(
+		aes(x = z, y = after_stat(density), fill = "latent"),
+		boundary = 0,
+		color = "black",
+		binwidth = 0.1
+	) +
+	geom_histogram(
+		aes(x = y, y = after_stat(density), fill = "observed"),
+		boundary = 0,
+		color = "black",
+		binwidth = 0.1
+	) +
+	scale_fill_manual(
+		values = c("#E69F0050", "#56B4E950"),
+		name = NULL
+	)
+```
+
+* The standard MLE (assuming a normal distribution) doesn't work.
+
+```{r}
+#| label: simple example table
+#| echo: true
+
+simple_ex |>
+	dplyr::select(-lod) |>
+	tidyr::pivot_longer(c(z, y)) |>
+	dplyr::summarise(
+		mean = mean(value),
+		variance = var(value),
+		.by = c(name)
+	) |>
+	dplyr::mutate(
+		variable = ifelse(name == "z", "latent", "censored"),
+		.keep = "unused",
+		.before = dplyr::everything()
+	) |>
+	tibble::add_row(
+		variable = "truth",
+		mean = 0,
+		variance = 1,
+		.before = 1
+	) |>
+	knitr::kable(digits = 3)
+```
+
+* We can see that the mean is overestimated and the variance is underestimated. 
+* If we did standard $t$-tests for the mean, and $\chi^2$-test for the variance,
+we would get that the latent variable gives the correct decision (fail to
+reject), while the censored variable would reject both.
+* As the proportion of data that are censored increases, the bias gets worse (proof not shown, but true in general).
+
+::: {style="font-size: 50%;"}
+
+* Mean estimate: $\bar{x} = \frac{1}{n} \sum_{i=1}^nx_i$.
+* Var estimate: $s^2_x = \frac{1}{n-1}\sum_{i=1}^n\left(x_i-\bar{x}\right)^2$.
+
+:::
+
+## How do we fix it?
+
+* We need to modify the likelihood. Recall that for a parametric model assuming
+mutually independent observations, the likelihood of the sample is
+
+$$
+\mathcal{L}(\vec{\theta} \mid \vec{x}) = \prod_{i=1}^n f_X\left(x_i \mid \vec{\theta}\right)
+$$
+
+where $f_X$ is the probability density function of random variable $X$ imposed
+by some parametric model.
+* This is easy to do for our latent variable. Since we know what the normal PDF looks like, we can write
+
+$$
+\mathcal{L}\left( \begin{bmatrix}\mu \\ \sigma\end{bmatrix} \mid \vec{z}\right) = \prod_{i=1}^n \frac{1}{\sigma\sqrt{2\pi}}\exp\left(-\frac{1}{2}\left(\frac{x-\mu}{\sigma}\right)^2\right),
+$$
+and we simultaneously maximize (or typically minimize the negative log-likelihood) over both $\mu$ and $\sigma$.
+
+* Two paths from here: add priors and sample from the posterior distribution of $\vec{\theta}$, or find the argmax w.r.t. $\vec{\theta}$.
+
+### It's a bit harder for censored data.
+
+* For our censored problem, we first need to write out the pdf.
+* Let $C_i$ be an indicator for whether $Z_i$ is censored, that is,
+
+$$
+C_i = \begin{cases}
+1, & Z_i < -1 \\
+0, & Z_i \geq -1
+\end{cases}.
+$$
+
+* The central observation we need to make is that (skipping over technical issues with the point probability of a continuous R.V.)
+
+$$
+\mathrm{Pr}\left(Y_i =-1\right) = \mathrm{Pr}\left(Z_i \leq -1\right)=\int_{-\infty}^{-1}f_{Z}\left(y_i \mid \vec{\theta}\right)\ dy_i = F_Z\left(-1 \mid \vec{\theta}\right).
+$$
+
+* This induces a point mass in the probability distribution of $Y$.
+* Joke about the Lesbegue decomposition theorem
+* Using the indicator $C$, we can write the likelihood of $Y_i$ as
+
+$$
+\mathcal{L}\left(y_i \mid \vec{\theta}\right) = f_Z\left(y_i \mid \vec{\theta}\right)^{c_i - 1} \cdot F_Z\left(-1 \mid \vec{\theta}\right)^{c_i}.
+$$
+
+* Now, we could maximize the censored data likelihood ourselves.
+
+```{r}
+ex_ll <- function(mu, sigma, x, L) {
+	vals <- ifelse(
+		x > L,
+		dnorm(x, mu, sigma, log = TRUE),
+		pnorm(L, mu, sigma, log.p = TRUE)
+	)
+	
+	out <- sum(vals)
+	return(out)
+}
+
+simple_ll <-
+	tidyr::expand_grid(
+		mu = seq(-2, 2, 0.01),
+		sigma = seq(0, 2, 0.01)
+	) |>
+	dplyr::mutate(
+		ll = purrr::map2_dbl(
+			mu, sigma,
+			\(m, s) ex_ll(m, s, x = simple_ex$y, L = -1)
+		)
+	)
+
+simple_ll |>
+	dplyr::slice_max(ll) |>
+	knitr::kable(digits = 3)
+```
+
+* There are also built in methods in base R (specifically the `survival`)
+package which implement this likelihood adjustment for us.
+* This is more convenient cause we can easily get CIs and other statistical
+stuff, but we have to use the insane syntax of `survival`.
+
+```{r}
+surv_fit <- survival::survreg(
+	survival::Surv(y, y > lod, type = "left") ~ 1,
+	data = simple_ex,
+	dist = "gaussian"
+)
+
+surv_est <-
+	broom::tidy(surv_fit) |>
+	dplyr::mutate(
+		term = ifelse(term == "(Intercept)", "mean", "variance"),
+		lwr = estimate - 1.96 * std.error,
+		upr = estimate + 1.96 * std.error,
+	) |>
+	dplyr::select(term, estimate, lwr, upr) |>
+	as.data.frame()
+
+surv_est[2, 2:4] <- exp(surv_est[2, 2:4])
+knitr::kable(surv_est, digits = 3)
+```
+
+* We can also easily fit the model in a Bayesian framework using `brms`.
+
+```{r, eval = FALSE}
+brms_dat <- simple_ex
+brms_dat$c <- ifelse(brms_dat$z < brms_dat$lod, "left", "none")
+
+brms_fit <-
+	brms::brm(
+		formula = y | cens(c) ~ 1,
+		data = brms_dat,
+		family = gaussian()
+	)
+
+summary(brms_fit)
+```
+
+## Example 1: HAI
+
+* In this example, I'll discuss one of my current research interests and work
+through an example with predictors.
+* We'll also discuss a model with a ratio of censored variables as the outcome.
+
+### UGAFluVac data description
+
+* Data from Ted Ross, collected at UGA from Jan 2017 -- April 2020.
+
+
+## Example 2: norovirus vaccines
+
+* In this example, I'll discuss one of Savannah's current projects.
+* We'll work through a model with a non-normal outcome and a censored predictor.
+
+<!-- END OF FILE -->

@@ -23,11 +23,12 @@ Learning outcomes for this presentation:
 deterministic censoring.
 1. Implement maximum likelihood methods for censored outcomes, like HAI titer
 using an optimizer and using the `survival` package.
-1. Ratios of censored values (e.g. titer increase outcomes).
 1. Implement bayesian methods for censored outcomes, like HAI titer, using Stan
 or `brms`.
 1. Implement bayesian joint modeling methods for censored predictors, like
 norovirus HBGA titer for infection outcome in the bivalent study using Stan.
   - https://github.com/ahgroup/NoV-Ab-Correlates-of-Protection/tree/main
+1. Ratios of censored values (e.g. titer increase outcomes); HAI with
+censored outcome and predictor.
 
 
