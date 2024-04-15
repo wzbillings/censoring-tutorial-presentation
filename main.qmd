@@ -12,6 +12,8 @@ format:
 execute: 
   freeze: auto
   echo: true
+filters:
+  - include-code-files
 ---
 
 ```{r setup, include = FALSE}
@@ -31,7 +33,7 @@ hai_dat <- readr::read_rds(here::here("data", "hai-clean.Rds"))
 ## Censored data are partially known.
 
 * In general if a data point $x$ is censored, we don't know the exact
-value of $x$, but we know that $x \in \left(x_L, x_u\right)$.
+value of $x$, but we know that $x \in \left(x_L, x_U\right)$.
 * The most common example in epidemiology is a time-to-event outcome in
 survival analysis.
 
@@ -171,7 +173,7 @@ ggplot(lc_example) +
 ```
 
 * Immunological measurements often have a lower limit to the titer that can
-be accurately measured. (The *lower limit of detection, LoD*.)
+be accurately measured. (The lower limit of detection, LoD.)
 * In this plot, if the true ("latent") antibody titer is less than 2 is
 recorded as 2. Although those values are really in $(0, 2]$ on the natural
 scale, or $(-\infty, 1]$ on the log scale.
@@ -471,6 +473,7 @@ $$
 
 where $f_X$ is the probability density function of random variable $X$ imposed
 by some parametric model.
+
 * This is easy to do for our latent variable. Since we know what the normal PDF looks like, we can write
 
 $$
@@ -509,6 +512,8 @@ $$
 * Now, we could maximize the censored data likelihood ourselves.
 
 ```{r}
+#| label: simple mle by hand
+
 ex_ll <- function(mu, sigma, x, L) {
 	vals <- ifelse(
 		x > L,
@@ -543,6 +548,8 @@ package which implement this likelihood adjustment for us.
 stuff, but we have to use the insane syntax of `survival`.
 
 ```{r}
+#| label: adjusted mle using survival
+
 surv_fit <- survival::survreg(
 	survival::Surv(y, y > lod, type = "left") ~ 1,
 	data = simple_ex,
@@ -565,7 +572,9 @@ knitr::kable(surv_est, digits = 3)
 
 * We can also easily fit the model in a Bayesian framework using `brms`.
 
-```{r, eval = FALSE}
+```{r}
+#| label: adjusted brms fit for simple exmaple
+
 brms_dat <- simple_ex
 brms_dat$c <- ifelse(brms_dat$z < brms_dat$lod, "left", "none")
 
@@ -599,6 +608,8 @@ each individual in the study.
 same individual in subsequent years and pretend they are new people.
 
 ```{r}
+#| label: hai plot
+
 set.seed(101)
 sampled_ids <- sample(hai_dat$uniq_id |> unique(), size = 10)
 
@@ -622,6 +633,9 @@ hai_dat |>
 	)
 ```
 
+* Instead of looking at this as a trajectory, we can also just make a scatter
+plot since random and group effects are beyond today's discussion.
+
 * HAI titer is a serial dilution assay with a limit of detection at 5, so it
 has both interval censoring and left censoring (which defines a specific
 interval into which the outcome can be censored).
@@ -629,6 +643,8 @@ interval into which the outcome can be censored).
 for the different types of censoring makes a difference.
 
 ```{r}
+#| label: hai means
+
 hai_mean_naive <-
 	hai_dat |>
 	dplyr::summarise(mean_cl_boot(posttiter)) |>
@@ -662,8 +678,13 @@ hai_dat_interval <-
 
 hai_dat_interval |>
 	dplyr::select(posttiter, post_min, post_max) |>
-	dplyr::mutate(across(everything(), hai_inverse))
+	head() |>
+	knitr::kable(digits = 3, caption = "interval2 format example")
+```
 
+
+```{r}
+#| label: interval2 surv fit
 surv_fit_hai_interval2 <-
 	survival::survreg(
 		survival::Surv(post_min, post_max, type = 'interval2') ~ 1,
@@ -699,6 +720,8 @@ through them.
 * First, we'll look at the naive fit, which doesn't adjust for censoring.
 
 ```{r}
+#| label: hai simple fit
+
 hai_simple_fit <-
 	lm(
 		posttiter ~ norm_dist,
@@ -712,6 +735,8 @@ broom::tidy(hai_simple_fit)
 the survival package.
 
 ```{r}
+#| label: hai survival fit
+
 hai_surv_fit <-
 		survival::survreg(
 		survival::Surv(post_min, post_max, type = 'interval2') ~ norm_dist,
@@ -725,18 +750,36 @@ broom::tidy(hai_surv_fit)
 * Wow! When we do the interval censoring adjustment, the effect of antigenic
 distance is stronger than we thought under the naive model!
 
-* Next we'll look at a Bayesian fit using `brms`.
+* Next we'll look at a Bayesian fit using `brms`. We have to do a bit more
+cleaning though because of the format that `brms` uses, which isn't the same
+as `interval2` form.
 
 ```{r}
+#| label: hai brms data
+
 hai_dat_interval$cens <-
 	ifelse(hai_dat_interval$post_min == -Inf, "left", "interval")
 
+hai_dat_interval |>
+	dplyr::select(posttiter, cens, post_max) |>
+	head() |>
+	knitr::kable(digits = 3, caption = "brms censoring format")
+```
+
+```{r}
+#| label: hai brms fit
 hai_brms_fit <-
 	brms::brm(
 		posttiter | cens(cens, post_max) ~ norm_dist,
 		family = gaussian(),
 		data = hai_dat_interval
 	)
+```
+
+After sampling we can take a look at the model fit.
+
+```{r}
+#| label: hai brms summary
 
 summary(hai_brms_fit)
 ```
@@ -746,13 +789,26 @@ the `brms` version because `brms` has a lot of Stan code improvements that
 speed up the code but are more difficult to read and write for me. However,
 if we include censored predictors we'll be forced to write our own Stan code.
 
+```{.stan include="stan/hai-censored-outcome.stan"}
+```
+
+First we have to compile the Stan code.
+
 ```{r}
+#| label: hai stan setup
+
 mod_pth <- here::here("stan", "hai-censored-outcome.stan")
 hai_stan_mod <- cmdstanr::cmdstan_model(mod_pth, compile = FALSE)
 hai_stan_mod$compile(pedantic = TRUE, force_recompile = TRUE)
 ```
 
+We also have to format our data in a specific way for Stan. Stan only accepts
+numeric variables, and the input needs to be a list because the inputs can
+vary in length.
+
 ```{r}
+#| label: hai stan data
+
 hai_stan_dat <-
 	hai_dat_interval |>
 	dplyr::select(
@@ -767,6 +823,12 @@ hai_stan_dat <-
 	) |>
 	as.list()
 hai_stan_dat$N <- nrow(hai_dat_interval)
+```
+
+Now we can sample from the model.
+
+```{r}
+#| label: hai stan sampling
 
 hai_stan_fit <- hai_stan_mod$sample(
 	hai_stan_dat,
@@ -775,11 +837,13 @@ hai_stan_fit <- hai_stan_mod$sample(
 	iter_warmup = 1000,
 	iter_sampling = 1000
 )
-
-hai_stan_post <- posterior::as_draws_df(hai_stan_fit)
 ```
 
+And finally we can check the model fit.
+
 ```{r}
+#| label: hai stan summary
+
 hai_stan_fit
 ```
 
@@ -799,16 +863,26 @@ y_i &\sim \mathrm{Normal}\left(\alpha + \beta \cdot x_i, \sigma^2\right) \\
 x_i &\sim \mathrm{Normal}\left(\mu_x, \sigma^2_x\right)
 \end{aligned}
 $$
-(**This specific model is not identifiable without further constraints!**)
-* If we assume that the $y_i$ are conditionally independent of $x_i$, then
+
+* **This specific model is not identifiable without further constraints!**
+* If we assume that the $y_i$ are conditionally independent of $x_i$ (this is the typical linear regression assumption), then
 
 $$
 \mathcal{L}\left(\theta \mid x, y\right) = \prod_{i=1}^n f_X(x \mid \theta)\cdot f_{Y \mid X}\left(y \mid \theta, X = x\right).
 $$
-* Some people probably don't like this assumption, but usually people are OK
+
+* The main issue here is that's not necessarily true, because
+
+$$
+f_{X, Y}(x, y) \neq f_X(x)\cdot f_Y(y)
+$$
+in general.
+
+* Usually people are OK
 with assuming that $x$ is a constant, even when that doesn't make sense, so
-I'm pretty much fine with it. However, there's also the option of using a
-copula function to construct the joint likelihood, which is not too hard if you
+I'm pretty much fine with assuming marginal independence.
+* However, there's also the option of using a
+[copula function](https://en.wikipedia.org/wiki/Copula_(probability_theory)) to construct the joint likelihood, which is not too hard if you
 use a Bayesian model. But choosing a copula is a whole additional issue.
 * **This likelihood can be hard to optimize.** AFAIK, there are not any
 packages for `R` that deal with censored predictors in a frequentist
@@ -826,6 +900,8 @@ the effect of an antibody on the outcome, including an interaction with the
 effect of the treatment.
 
 ```{r}
+#| label: nov dat loading
+
 nov_dat <- readr::read_rds(here::here("data", "nov-clean.Rds"))
 
 dplyr::glimpse(nov_dat)
@@ -836,6 +912,15 @@ vaccine, then got norovirus challenged, and they were followed up to see if
 they got infected. Savannah knows all the details about the antibody assay
 I'm looking at and the timing and stuff. Those details aren't really necessary
 for what I'm trying to do here.
+
+```{r}
+#| label: nov dat plot
+
+ggplot(nov_dat) +
+	aes(x = log(gii_pgm), y = protected, color = factor(treatment)) +
+	geom_point(position = position_jitter(height = 0.15, width = 0))
+```
+
 * Since there is a big clump of values at $92$, we'll use that as the limit of
 detection for the assay, although I think Savannah had some other issues with
 the LoD. However, for our purposes this will just be a left-censored predictor
@@ -845,12 +930,12 @@ with the LoD at $92$.
 $$
 \begin{align*}
 y_i &\sim \text{Bernoulli}\left(p_i\right) \\
-\mathrm{logit}(p_i) &= \beta_{1, T[i]} + \beta_{2, T[i]} \cdot x^*_i \\
+\mathrm{logit}(p_i) &= \beta_{1, T[i]} + \beta_{2, T[i]} \cdot \log\left(x^*_i\right)\\
 \log\left(x_i^*\right) &\sim \mathrm{Normal}\left(\mu_x, \sigma^2_x\right) \\
 \mu_x &= \alpha_{T[i]} \\
 x_i &= \begin{cases}
-U, & x^*_i < \mathrm{LoD} \\
-x^*_i, & x^*_i \geq \mathrm{LoD}
+U, & x^*_i \leq \mathrm{LoD} \\
+x^*_i, & x^*_i > \mathrm{LoD}
 \end{cases} \\
 T[i] &= \begin{cases}
 1, & \text{individual } i \text{ is in the placebo group} \\
@@ -862,9 +947,12 @@ $$
 * Because the effect of $x$ is group-dependent, parametrizing this in a frequentist
 way is really very difficult and there is not a director comparison to a
 `glm()`-type method.
-* First we need to compile the stan code that implements this model.
+
+* We need to do a bit of set up with our data set.
 
 ```{r}
+#| label: nov stan data cleaning
+
 nov_stan_dat <-
 	nov_dat |>
 	dplyr::mutate(
@@ -885,6 +973,18 @@ nov_stan_dat_naive$x_l <- rep(0, times = nov_stan_dat$N)
 nov_stan_dat_cens <- nov_stan_dat
 nov_stan_dat_cens$x_l <- rep(log(92), times = nov_stan_dat$N)
 
+str(nov_stan_dat_cens, 1)
+```
+
+* Let's take a look at the Stan code that implements the model.
+
+```{.stan include="stan/nov-censored-predictor.stan"}
+```
+
+* We need to compile the stan code that implements this model.
+
+```{r}
+#| label: nov stan setup
 # Compile the stan model
 nov_mod_pth <- here::here("stan", "nov-censored-predictor.stan")
 nov_stan_mod <- cmdstanr::cmdstan_model(nov_mod_pth, compile = FALSE)
@@ -895,6 +995,8 @@ nov_stan_mod$compile(pedantic = TRUE, force_recompile = TRUE)
 without a correction for censoring.
 
 ```{r}
+#| label: nov stan naive fit
+
 nov_stan_fit_naive <- nov_stan_mod$sample(
 	nov_stan_dat_naive,
 	seed = 923154,
@@ -904,13 +1006,19 @@ nov_stan_fit_naive <- nov_stan_mod$sample(
 )
 ```
 
+We'll take a look at the model estimates.
+
 ```{r}
+#| label: nov stan naive summary
+
 nov_stan_fit_naive
 ```
 
 * Now we can run the model with the censoring correction.
 
 ```{r}
+#| label: nov stan cens fit
+
 nov_stan_fit_cens <- nov_stan_mod$sample(
 	nov_stan_dat_cens,
 	seed = 923154,
@@ -920,14 +1028,45 @@ nov_stan_fit_cens <- nov_stan_mod$sample(
 )
 ```
 
+And we can look at the estimates with the censoring correction -- notably our
+effect of the treatment estimates doesn't seem to change, but some of the
+others change a bit.
+
 ```{r}
+#| label: nov stan cens summary
+
 nov_stan_fit_cens
 ```
 
+## Math on censored variables
+
+For HAI score and other accepted surrogate endpoints in clinical trials,
+we would like to analyze the change from baseline directly as the outcome of
+our model. For HAI, this usually called the fold change on the natural scale or
+the titer increase on the log scale. We can compute this as follows.
+
 ```{r}
-ggplot(nov_dat) +
-	aes(x = log(gii_pgm), y = protected, color = factor(treatment)) +
-	geom_point(position = position_jitter(height = 0.15, width = 0))
+hai_dat$titer_increase <- hai_dat$posttiter - hai_dat$pretiter
+hai_dat$fold_change <- 2 ^ hai_dat$titer_increase
 ```
+
+Notably, these two values both involve doing math on a censored variable, so
+it is not immediately obvious how to deal with censoring in these outcomes.
+For the fold change, we consider the following cases.
+
+|  Pre-titer  |  Post-titer | Censored? |                     Fold change (lower bound)                     | Fold change (upper bound)                                      |
+|:-----------:|:-----------:|-----------|:-----------------------------------------------------------------:|----------------------------------------------------------------|
+| $$<10$$     | $$<10$$     | Yes       | $$\lim_{b\to 0} \frac{\text{post}}{b} = 0$$                       | $$\lim_{a\to 0} \frac{a}{\text{pre}} = \infty$$                |
+| $$<10$$     | $$\geq 10$$ | Yes       | $$\lim_{b\to 10} \frac{\text{post}}{b} = \frac{\text{post}}{10}$$ | $$\lim_{b\to 0} \frac{\text{post}}{b} = \infty$$               |
+| $$\geq 10$$ | $$<10$$     | Yes       | $$\lim_{a\to 0}\frac{a}{\text{pre}} = 0$$                         | $$\lim_{a\to 10}\frac{a}{\text{pre}} = \frac{10}{\text{pre}}$$ |
+| $$\geq 10$$ | $$\geq 10$$ | No        | $$\frac{\text{post}}{\text{pre}}$$                                | $$\frac{\text{post}}{\text{pre}}$$                             |
+
+Taking $\lim_{a\to 0} \log(a) = -\infty$ and $\lim_{a\to \infty} \log(a) = \infty$, we can get the equivalent bounds for the titer increase. We can then implement models with the fold change or titer increase as the outcome. However, note that
+this reduces our effective sample size for the process of estimation, because any values where both the pre-titer and post-titer are censored span the entire domain,
+and thus contribute nothing to the likelihood. This results as a consequence of
+the indeterminate form $\frac{0}{0}$ appearing in the limit.
+
+Modeling the post-titer and pre-titer separately or jointly rather than modeling
+the change will better account for censoring without the issue of this indeterminate form.
 
 <!-- END OF FILE -->
