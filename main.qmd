@@ -21,7 +21,10 @@ library(lubridate)
 library(patchwork)
 library(brms)
 library(cmdstanr)
+library(Hmisc)
 ggplot2::theme_set(hgp::theme_ms())
+
+hai_dat <- readr::read_rds(here::here("data", "hai-clean.Rds"))
 ```
 
 
@@ -584,12 +587,347 @@ through an example with predictors.
 
 ### UGAFluVac data description
 
-* Data from Ted Ross, collected at UGA from Jan 2017 -- April 2020.
+* Data from Ted Ross, collected at three study sites (PA, FL, and UGA) between
+September 2014 and April 2017. All individuals received a vaccine containing
+A/H1N1/California/NUMBER/2009-like virus.
+* Each individual gave a study sample before vaccination and 21 days after.
+Lab workers did HAI assays against a large panel of historical strains.
+* We calculated the antigenic distance between each historical
+strain and the vaccine strain, so we have an "antibody landscape" for 
+each individual in the study.
+* For the purpose of this analysis, we ignore repeated measurements of the
+same individual in subsequent years and pretend they are new people.
 
+```{r}
+set.seed(101)
+sampled_ids <- sample(hai_dat$uniq_id |> unique(), size = 10)
 
-## Example 2: norovirus vaccines
+hai_dat |>
+	dplyr::filter(uniq_id %in% sampled_ids) |>
+	ggplot() +
+	aes(x = norm_dist, y = 2 ^ posttiter, group = id, color = factor(id)) +
+	geom_line(
+		show.legend = FALSE
+	) +
+	scale_color_viridis_d(begin = 0.1, end = 0.9) +
+	scale_y_continuous(
+		trans = "log2",
+		breaks = 2 ^ seq(0, 10),
+		labels = 5 * 2 ^ seq(0, 10)
+	) +
+	labs(
+		y = "Post-vaccination HAI titer",
+		x = "Normalized antigenic distance",
+		title = "Antibody landscape for 10 randomly sampled individuals"
+	)
+```
 
-* In this example, I'll discuss one of Savannah's current projects.
-* We'll work through a model with a non-normal outcome and a censored predictor.
+* HAI titer is a serial dilution assay with a limit of detection at 5, so it
+has both interval censoring and left censoring (which defines a specific
+interval into which the outcome can be censored).
+* Even with just a basic estimate of the mean post-titer value, adjusting
+for the different types of censoring makes a difference.
+
+```{r}
+hai_mean_naive <-
+	hai_dat |>
+	dplyr::summarise(mean_cl_boot(posttiter)) |>
+	dplyr::mutate(across(everything(), hai_inverse)) |>
+	dplyr::mutate(method = "Naive", .before = everything())
+
+surv_fit_hai_simple <-
+	survival::survreg(
+		survival::Surv(posttiter, posttiter > 0, type = 'left') ~ 1,
+		data = hai_dat,
+		dist = "gaussian"
+	)
+
+hai_mean_lod <-
+	broom::tidy(surv_fit_hai_simple, conf.int = TRUE) |>
+	dplyr::filter(term == "(Intercept)") |>
+	dplyr::mutate(
+		y = hai_inverse(estimate),
+		ymin = hai_inverse(conf.low),
+		ymax = hai_inverse(conf.high),
+		.keep = "none"
+	) |>
+	dplyr::mutate(method = "LoD only", .before = everything())
+
+hai_dat_interval <-
+	hai_dat |>
+	dplyr::mutate(
+		post_min = ifelse(posttiter == 0, -Inf, posttiter),
+		post_max = ifelse(posttiter == 0, 0, posttiter + 1)
+	)
+
+hai_dat_interval |>
+	dplyr::select(posttiter, post_min, post_max) |>
+	dplyr::mutate(across(everything(), hai_inverse))
+
+surv_fit_hai_interval2 <-
+	survival::survreg(
+		survival::Surv(post_min, post_max, type = 'interval2') ~ 1,
+		data = hai_dat_interval,
+		dist = "gaussian"
+	)
+
+hai_mean_int <-
+	broom::tidy(surv_fit_hai_interval2, conf.int = TRUE) |>
+	dplyr::filter(term == "(Intercept)") |>
+	dplyr::mutate(
+		y = hai_inverse(estimate),
+		ymin = hai_inverse(conf.low),
+		ymax = hai_inverse(conf.high),
+		.keep = "none"
+	) |>
+	dplyr::mutate(method = "Interval censoring", .before = everything())
+
+dplyr::bind_rows(hai_mean_naive, hai_mean_lod, hai_mean_int) |>
+	dplyr::rename(
+		estimate = y,
+		lower = ymin,
+		upper = ymax
+	) |>
+	knitr::kable(digits = 3)
+```
+
+* Now let's compare models for our actual research question, which is the
+effect of antigenic distance on the post-vaccination titer. That is, we want
+to summarize all of the individual antibody landscapes by fitting a line
+through them.
+
+* First, we'll look at the naive fit, which doesn't adjust for censoring.
+
+```{r}
+hai_simple_fit <-
+	lm(
+		posttiter ~ norm_dist,
+		data = hai_dat_interval
+	)
+
+broom::tidy(hai_simple_fit)
+```
+
+* Next we'll look at a frequentist fit which adjusts for censoring using
+the survival package.
+
+```{r}
+hai_surv_fit <-
+		survival::survreg(
+		survival::Surv(post_min, post_max, type = 'interval2') ~ norm_dist,
+		data = hai_dat_interval,
+		dist = "gaussian"
+	)
+
+broom::tidy(hai_surv_fit)
+```
+
+* Wow! When we do the interval censoring adjustment, the effect of antigenic
+distance is stronger than we thought under the naive model!
+
+* Next we'll look at a Bayesian fit using `brms`.
+
+```{r}
+hai_dat_interval$cens <-
+	ifelse(hai_dat_interval$post_min == -Inf, "left", "interval")
+
+hai_brms_fit <-
+	brms::brm(
+		posttiter | cens(cens, post_max) ~ norm_dist,
+		family = gaussian(),
+		data = hai_dat_interval
+	)
+
+summary(hai_brms_fit)
+```
+
+* Finally we can do a fit using our own Stan code. This is a bit slower than
+the `brms` version because `brms` has a lot of Stan code improvements that
+speed up the code but are more difficult to read and write for me. However,
+if we include censored predictors we'll be forced to write our own Stan code.
+
+```{r}
+mod_pth <- here::here("stan", "hai-censored-outcome.stan")
+hai_stan_mod <- cmdstanr::cmdstan_model(mod_pth, compile = FALSE)
+hai_stan_mod$compile(pedantic = TRUE, force_recompile = TRUE)
+```
+
+```{r}
+hai_stan_dat <-
+	hai_dat_interval |>
+	dplyr::select(
+		x = norm_dist,
+		y_l = post_min,
+		y_u = post_max,
+		c = cens
+	) |>
+	# Convert cens to integer following brms convention
+	dplyr::mutate(
+		c = ifelse(c == "left", -1L, 2L)
+	) |>
+	as.list()
+hai_stan_dat$N <- nrow(hai_dat_interval)
+
+hai_stan_fit <- hai_stan_mod$sample(
+	hai_stan_dat,
+	seed = 923154,
+	parallel_chains = 4,
+	iter_warmup = 1000,
+	iter_sampling = 1000
+)
+
+hai_stan_post <- posterior::as_draws_df(hai_stan_fit)
+```
+
+```{r}
+hai_stan_fit
+```
+
+## Dealing with censored predictors
+
+* Now, we might also want to deal with a censored predictor. Unfortunately, this
+is more difficult than dealing with a censored outcome.
+* In a standard linear regression model, **we assume the predictors are
+constant**. So if we want to incorporate censoring, we have to assume they
+can be observed with some type of error.
+* The easiest way to do this is to assume a parametric model for the predictor,
+e.g.
+
+$$
+\begin{aligned}
+y_i &\sim \mathrm{Normal}\left(\alpha + \beta \cdot x_i, \sigma^2\right) \\
+x_i &\sim \mathrm{Normal}\left(\mu_x, \sigma^2_x\right)
+\end{aligned}
+$$
+(**This specific model is not identifiable without further constraints!**)
+* If we assume that the $y_i$ are conditionally independent of $x_i$, then
+
+$$
+\mathcal{L}\left(\theta \mid x, y\right) = \prod_{i=1}^n f_X(x \mid \theta)\cdot f_{Y \mid X}\left(y \mid \theta, X = x\right).
+$$
+* Some people probably don't like this assumption, but usually people are OK
+with assuming that $x$ is a constant, even when that doesn't make sense, so
+I'm pretty much fine with it. However, there's also the option of using a
+copula function to construct the joint likelihood, which is not too hard if you
+use a Bayesian model. But choosing a copula is a whole additional issue.
+* **This likelihood can be hard to optimize.** AFAIK, there are not any
+packages for `R` that deal with censored predictors in a frequentist
+perspective, although you could numerically optimize it. You could also get CIs
+using bootstrapping or maybe a profile method.
+* However, joint modeling of $x$ and $y$ is not too difficult to do in Stan,
+so that's the approach we'll take.
+
+## Example 2: norovirus
+
+* This is one of Savannah's current projects, so I don't know too much about the
+data.
+* But it's from a norovirus vaccine clinical trial, and I'll be looking at
+the effect of an antibody on the outcome, including an interaction with the
+effect of the treatment.
+
+```{r}
+nov_dat <- readr::read_rds(here::here("data", "nov-clean.Rds"))
+
+dplyr::glimpse(nov_dat)
+```
+
+* All I really know about the data is that a bunch of people got the candidate
+vaccine, then got norovirus challenged, and they were followed up to see if
+they got infected. Savannah knows all the details about the antibody assay
+I'm looking at and the timing and stuff. Those details aren't really necessary
+for what I'm trying to do here.
+* Since there is a big clump of values at $92$, we'll use that as the limit of
+detection for the assay, although I think Savannah had some other issues with
+the LoD. However, for our purposes this will just be a left-censored predictor
+with the LoD at $92$.
+* Explain the model:
+
+$$
+\begin{align*}
+y_i &\sim \text{Bernoulli}\left(p_i\right) \\
+\mathrm{logit}(p_i) &= \beta_{1, T[i]} + \beta_{2, T[i]} \cdot x^*_i \\
+\log\left(x_i^*\right) &\sim \mathrm{Normal}\left(\mu_x, \sigma^2_x\right) \\
+\mu_x &= \alpha_{T[i]} \\
+x_i &= \begin{cases}
+U, & x^*_i < \mathrm{LoD} \\
+x^*_i, & x^*_i \geq \mathrm{LoD}
+\end{cases} \\
+T[i] &= \begin{cases}
+1, & \text{individual } i \text{ is in the placebo group} \\
+2, & \text{individual } i \text{ is in the vaccine group}
+\end{cases}
+\end{align*}
+$$
+
+* Because the effect of $x$ is group-dependent, parametrizing this in a frequentist
+way is really very difficult and there is not a director comparison to a
+`glm()`-type method.
+* First we need to compile the stan code that implements this model.
+
+```{r}
+nov_stan_dat <-
+	nov_dat |>
+	dplyr::mutate(
+		t = treatment + 1,
+		x = log(gii_pgm),
+		y = protected,
+		.keep = "none"
+	) |>
+	as.list()
+nov_stan_dat$N <- nrow(nov_dat)
+nov_stan_dat$k <- 2
+
+# Version of data where model doesn't implement censoring
+nov_stan_dat_naive <- nov_stan_dat
+nov_stan_dat_naive$x_l <- rep(0, times = nov_stan_dat$N)
+
+# Version of data where model DOES implement censoring
+nov_stan_dat_cens <- nov_stan_dat
+nov_stan_dat_cens$x_l <- rep(log(92), times = nov_stan_dat$N)
+
+# Compile the stan model
+nov_mod_pth <- here::here("stan", "nov-censored-predictor.stan")
+nov_stan_mod <- cmdstanr::cmdstan_model(nov_mod_pth, compile = FALSE)
+nov_stan_mod$compile(pedantic = TRUE, force_recompile = TRUE)
+```
+
+* Since there's no frequentist model to compare to, let's first run the model
+without a correction for censoring.
+
+```{r}
+nov_stan_fit_naive <- nov_stan_mod$sample(
+	nov_stan_dat_naive,
+	seed = 923154,
+	parallel_chains = 4,
+	iter_warmup = 1000,
+	iter_sampling = 1000
+)
+```
+
+```{r}
+nov_stan_fit_naive
+```
+
+* Now we can run the model with the censoring correction.
+
+```{r}
+nov_stan_fit_cens <- nov_stan_mod$sample(
+	nov_stan_dat_cens,
+	seed = 923154,
+	parallel_chains = 4,
+	iter_warmup = 1000,
+	iter_sampling = 1000
+)
+```
+
+```{r}
+nov_stan_fit_cens
+```
+
+```{r}
+ggplot(nov_dat) +
+	aes(x = log(gii_pgm), y = protected, color = factor(treatment)) +
+	geom_point(position = position_jitter(height = 0.15, width = 0))
+```
 
 <!-- END OF FILE -->
