@@ -8,8 +8,6 @@
 // Data that must be passed in by the user
 	// N:
 		// a positive integer, the number of (X, y) observations.
-	// k:
-		// a positive integer, the number of treatment groups.
 	// t:
 		// a 1D integer array of size [N], contained to be in 1, 2, ..., k.
 		// t[i] is the treatment group of the i-th individual.
@@ -25,7 +23,6 @@
 		// different measurements.
 data {
 	int<lower=0> N;
-	int<lower=1> k;
 	array[N] int<lower=0, upper=k> t;
 	array[N] int<lower=0, upper=1> y;
 	array[N] real x;
@@ -35,14 +32,12 @@ data {
 // Model parameters
 parameters {
 	// Parameters in model for x
-	//real alpha_0;
-	array[k] real alpha_1;
+	array[2] real alpha_1;
 	real<lower=0> sigma_x;
 	
 	// Parameters in model for y
-	//real beta_0;
-	array[k] real beta_1;
-	array[k] real beta_2;
+	array[2] real beta_1;
+	array[2] real beta_2;
 }
 
 // The model
@@ -52,10 +47,8 @@ model {
 	vector[N] mu;
 	
 	// Priors
-	//alpha_0 ~ normal(0, 2);
 	alpha_1 ~ normal(0, 2); //Nb we could use MVN dist here if desired
 	sigma_x ~ normal(0, 2);
-	//beta_0 ~ normal(0, 2);
 	beta_1 ~ normal(0, 2);
 	beta_2 ~ normal(0, 2);
 	
